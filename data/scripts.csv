@@ -1,3 +1,2 @@
 id,titre,texte,cta,hashtags,product_slug,source_broll,music_hint,thumb_hint,account_bucket
-id,titre,texte,cta,hashtags,product_slug,source_broll,music_hint,thumb_hint,account_bucket
-1,"Vidéo test automatique","Ceci est une vidéo de test publiée par l’agent 🚀","Lien en bio","#test #ia #bot","#none","assets/test.mp4","","",""
+1,Test vidéo automatique,"Ceci est un test de publication réelle avec le fichier videoplayback.mp4.","Lien en bio","#test #auto #tiktok",,,videoplayback.mp4,,
