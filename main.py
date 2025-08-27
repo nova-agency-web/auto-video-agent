@@ -1,18 +1,53 @@
+# données/main.py
 import os
-from playwright.sync_api import sync_playwright
+import string
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload"
 
+# Cookies vraiment utiles pour une session TikTok web
+ALLOW_COOKIES = {
+    "sessionid", "sessionid_ss",
+    "sid_tt", "sid_guard",
+    "sid_ucp_v1", "ssid_ucp_v1",
+    "uid_tt", "uid_tt_ss",
+    "msToken", "odin_tt",
+    "s_v_web_id", "ttwid",
+    "tt_csrf_token", "cmpl_token",
+    # ces deux-là ne sont pas toujours requis, mais utiles
+    "multi_sids", "last_login_method",
+}
 
-def _parse_cookie_header(header: str):
+
+def clean_user_agent(raw: str) -> str:
+    """Nettoie un UA pour Playwright (pas de guillemets, pas de \n/\r, que des imprimables)."""
+    if not raw:
+        return ""
+    # strip espaces et guillemets
+    ua = raw.strip().strip('"').strip("'")
+    # remplace \r\n par espace
+    ua = ua.replace("\r", " ").replace("\n", " ")
+    # ne garder que les caractères imprimables
+    allowed = set(string.printable)
+    ua = "".join(ch if ch in allowed else " " for ch in ua)
+    # normaliser espaces multiples
+    ua = " ".join(ua.split())
+    return ua
+
+
+def parse_cookie_header(header: str):
     """
-    Transforme 'a=b; c=d; e=f' -> liste d'objets cookies Playwright.
-    Ajoute domain/path requis pour éviter Invalid cookie fields.
+    Transforme 'a=b; c=d; ...' en objets cookies Playwright valides.
+    - ignore les paires sans '=' ou nom vide
+    - filtre sur ALLOW_COOKIES (case-insensitive)
+    - ajoute domain/path requis
+    - duplique pour tiktok.com et www.tiktok.com
     """
     if not header:
         return []
-    pairs = [p.strip() for p in header.split(";")]
-    cookies = []
+
+    pairs = [p.strip() for p in header.split(";") if p.strip()]
+    items = []
     for p in pairs:
         if "=" not in p:
             continue
@@ -21,59 +56,94 @@ def _parse_cookie_header(header: str):
         value = value.strip()
         if not name:
             continue
-        cookies.append({
-            "name": name,
-            "value": value,
-            "domain": ".tiktok.com",  # obligatoire
-            "path": "/",              # obligatoire
-        })
-    return cookies
+        if name.lower() not in {n.lower() for n in ALLOW_COOKIES}:
+            continue
+
+        # deux domaines pour couvrir tous les sous-domaines Studio
+        items.append({"name": name, "value": value, "domain": ".tiktok.com", "path": "/"})
+        items.append({"name": name, "value": value, "domain": "www.tiktok.com", "path": "/"})
+
+    # dédoublonne (même name/domain/path)
+    uniq = {}
+    for c in items:
+        uniq[(c["name"], c["domain"], c["path"])] = c
+    return list(uniq.values())
 
 
-def publish_to_tiktok(cookie_raw: str, caption: str, video_path: str) -> bool:
-    ua = os.getenv("TIKTOK_UA") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+def publish_to_tiktok(cookie_raw: str, caption: str, video_path: str, ua_raw: str) -> bool:
+    ua = clean_user_agent(ua_raw) or (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    )
+
+    cookies = parse_cookie_header(cookie_raw)
+    if not cookies:
+        raise RuntimeError(
+            "Aucun cookie valide n’a été trouvé. "
+            "Copie/colle la ligne 'cookie:' complète de la requête 'upload' (onglet Network) "
+            "dans le secret TIKTOK_COOKIE."
+        )
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(
-            locale="fr-FR",
-            user_agent=ua,
-        )
-
-        # 1) Injecter les cookies correctement formés
-        cookies = _parse_cookie_header(cookie_raw)
-        if not cookies:
-            raise RuntimeError("Aucun cookie valide à injecter. Vérifie TIKTOK_COOKIE.")
+        context = browser.new_context(locale="fr-FR", user_agent=ua)
         context.add_cookies(cookies)
 
         page = context.new_page()
-
-        # 2) Aller sur TikTok Studio Upload
         page.goto(TIKTOK_UPLOAD_URL, wait_until="domcontentloaded")
 
-        # 3) Upload de la vidéo
-        input_sel = "input[type='file']"
-        page.set_input_files(input_sel, video_path)
+        # si on est redirigé vers la connexion, la session n’est pas valide
+        if "login" in page.url or "signin" in page.url.lower():
+            raise RuntimeError("Session non valide (redirigé vers la connexion). Cookies expirés/invalides.")
 
-        # 4) Légende (à ajuster si le sélecteur change)
-        try:
-            page.get_by_role("textbox").fill(caption)
-        except Exception:
-            print("⚠️ Impossible de trouver la zone de légende, sélecteur à adapter.")
+        # 1) Upload
+        file_input = "input[type='file']"
+        page.set_input_files(file_input, video_path)
 
-        # 5) Bouton Publier (à ajuster selon interface)
-        try:
-            page.get_by_role("button", name="Publier").click()
-            print("▶️ Vidéo en cours de publication...")
-        except Exception:
-            print("⚠️ Bouton Publier non trouvé, vérifie le sélecteur.")
+        # 2) Légende (sélecteurs possibles — l’un des deux passera suivant les versions UI)
+        caption_filled = False
+        for sel in [
+            '[data-e2e="video-caption-input"] textarea',
+            'textarea[placeholder*="Ajouter"]',
+            'div[contenteditable="true"]',
+        ]:
+            try:
+                page.wait_for_selector(sel, timeout=15000)
+                page.fill(sel, caption)
+                caption_filled = True
+                break
+            except PWTimeout:
+                continue
+            except Exception:
+                continue
 
-        # 6) Attente confirmation (optionnelle, selon interface)
+        if not caption_filled:
+            print("⚠️ Zone de légende introuvable — la publication peut quand même fonctionner.")
+
+        # 3) Publier
+        published = False
+        for sel in [
+            'button:has-text("Publier")',
+            'button:has-text("Post")',
+            '[data-e2e="publish-button"]',
+        ]:
+            try:
+                page.click(sel, timeout=20000)
+                published = True
+                break
+            except Exception:
+                continue
+
+        if not published:
+            raise RuntimeError("Bouton 'Publier' introuvable. Interface changée ?")
+
+        # 4) Confirmation (best-effort)
         try:
             page.wait_for_selector("text=Publié", timeout=120000)
             print("✅ Publication confirmée.")
-        except Exception:
-            print("⚠️ Confirmation non détectée, publication peut avoir fonctionné.")
+        except PWTimeout:
+            print("ℹ️ Confirmation non détectée — la publication peut quand même être envoyée.")
 
         context.close()
         browser.close()
@@ -82,10 +152,14 @@ def publish_to_tiktok(cookie_raw: str, caption: str, video_path: str) -> bool:
 
 def main():
     cookie_raw = os.getenv("TIKTOK_COOKIE", "")
+    ua_raw = os.getenv("TIKTOK_UA", "")
     caption = "Test upload vidéo automatique"
     video = "assets/test.mp4"
 
-    ok = publish_to_tiktok(cookie_raw, caption, video)
+    if not os.path.exists(video):
+        raise FileNotFoundError(f"Vidéo introuvable: {video}")
+
+    ok = publish_to_tiktok(cookie_raw, caption, video, ua_raw)
     print("Résultat:", "SUCCÈS ✅" if ok else "ÉCHEC ❌")
 
 
