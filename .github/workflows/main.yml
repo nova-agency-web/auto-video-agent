@@ -1,0 +1,44 @@
+name: Auto Video Agent
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # toutes les 3h
+  workflow_dispatch:
+    inputs:
+      ACCOUNT:
+        description: "Compte (trucs-malins | gadgets-utiles)"
+        required: true
+        default: "trucs-malins"
+      POSTS_TO_PUBLISH:
+        description: "Nombre de posts à publier"
+        required: true
+        default: "2"
+      DRY_RUN:
+        description: "true = simulation, false = publication réelle"
+        required: true
+        default: "true"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run agent
+        env:
+          ACCOUNT: ${{ github.event.inputs.ACCOUNT }}
+          POSTS_TO_PUBLISH: ${{ github.event.inputs.POSTS_TO_PUBLISH }}
+          DRY_RUN: ${{ github.event.inputs.DRY_RUN }}
+          # TIKTOK_COOKIE: ${{ secrets.TIKTOK_COOKIE }}   # à brancher quand prêt
+        run: |
+          python main.py
