@@ -10,12 +10,15 @@ from playwright.sync_api import sync_playwright, Browser, Page
 ACCOUNT = os.getenv("ACCOUNT", "trucs→malins")
 POSTS_TO_PUBLISH = int(os.getenv("POSTS_TO_PUBLISH", "1"))
 DRY_RUN = os.getenv("DRY_RUN", "FALSE").strip().upper() == "TRUE"
+
 TIKTOK_COOKIE = os.getenv("TIKTOK_COOKIE", "").strip()
 TIKTOK_UA = os.getenv("TIKTOK_UA", "").strip()
+
 VIDEO_PATH = os.getenv("VIDEO_PATH", "assets/test.mp4")
 CAPTION_TEXT = os.getenv("CAPTION_TEXT", "Post upload vidéo automatique")
 UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload"
-HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"  # mettre HEADLESS=false pour debug local
+
+HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"  # HEADLESS=false pour debug
 
 def log(msg: str): print(msg, flush=True)
 
@@ -38,7 +41,7 @@ def parse_cookie_blob(blob: str):
             "sameSite": "Lax",
         }
 
-    # JSON dict / list ?
+    # JSON dict/list ?
     try:
         data = json.loads(blob)
         if isinstance(data, dict):
@@ -59,7 +62,7 @@ def parse_cookie_blob(blob: str):
     except Exception:
         pass
 
-    # lignes "k=v" séparées par ; ou \n
+    # “k=v” séparés par ; ou \n
     for p in re.split(r"[;\n]+", blob):
         p = p.strip()
         if not p or "=" not in p: continue
@@ -93,9 +96,6 @@ def go_to_upload(page: Page):
 # Upload via FileChooser
 # --------------------------
 def trigger_upload_ui(page: Page) -> bool:
-    """
-    Tente de cliquer différents CTA/zone pour ouvrir le sélecteur de fichiers.
-    """
     triggers = [
         "button:has-text('Sélectionner une vidéo')",
         "button:has-text('Select video')",
@@ -104,8 +104,7 @@ def trigger_upload_ui(page: Page) -> bool:
         "button:has-text('Importer')",
         "div:has-text('Sélectionne une vidéo')",
         "div:has-text('Select a video')",
-        # parfois une icône 'plus' ou 'upload' cliquable :
-        "button svg",
+        "button svg",  # icône upload
     ]
     for sel in triggers:
         try:
@@ -119,28 +118,21 @@ def trigger_upload_ui(page: Page) -> bool:
     return False
 
 def attach_video_via_filechooser(page: Page, file_path: str) -> bool:
-    """
-    Méthode robuste : on attend le file chooser, puis on clique différents triggers.
-    """
-    # 1) si un vrai input visible existe, on le prend directement
+    # 1) input direct si accessible
     try:
         inp = page.locator('input[type="file"]').first
         inp.wait_for(state="attached", timeout=2000)
-        # si invisible, set_input_files marche parfois quand même :
         inp.set_input_files(file_path)
         log("[INFO] Upload (input direct) déclenché ✅")
         return True
     except Exception:
         pass
 
-    # 2) filechooser (cas Studio)
-    timeout_ms = 15_000
+    # 2) file chooser
     try:
-        with page.expect_file_chooser(timeout=timeout_ms) as fc_info:
-            # on déclenche via les différents boutons
+        with page.expect_file_chooser(timeout=15_000) as fc_info:
             if not trigger_upload_ui(page):
-                # un second essai après un petit scroll
-                page.mouse.wheel(0, 600)
+                page.mouse.wheel(0, 800)
                 time.sleep(0.3)
                 if not trigger_upload_ui(page):
                     raise RuntimeError("Aucun déclencheur d'upload cliquable trouvé.")
@@ -153,7 +145,138 @@ def attach_video_via_filechooser(page: Page, file_path: str) -> bool:
         return False
 
 # --------------------------
-# Légende + Publication
+# Traitement & Publish
+# --------------------------
+PROCESS_TEXT_MARKERS = [
+    "processing", "traitement", "generating", "génération",
+    "checking", "analyse", "analyzing", "%",
+]
+
+def is_processing_visible(page: Page) -> bool:
+    """Retourne True si on voit des pourcentages / messages de traitement."""
+    try:
+        # pourcentages typiques
+        texts = page.locator("text=%").all_text_contents()
+        if any(re.search(r"\d+\s*%", t) for t in texts):
+            return True
+    except Exception:
+        pass
+
+    try:
+        # libellés fréquents
+        txts = " ".join(page.locator("body").all_text_contents()[:3]).lower()
+        if any(m in txts for m in PROCESS_TEXT_MARKERS):
+            return True
+    except Exception:
+        pass
+
+    # barres progress possibles
+    try:
+        bars = page.locator("progress,[role='progressbar']").count()
+        if bars and bars > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+def dismiss_small_blockers(page: Page):
+    """Ferme quelques popins fréquentes qui bloquent la zone bouton."""
+    candidates = [
+        "button:has-text('OK')",
+        "button:has-text('Got it')",
+        "button:has-text('Compris')",
+        "button:has-text('Close')",
+        "button[aria-label='Close']",
+        "[role='dialog'] button:has-text('OK')",
+    ]
+    for sel in candidates:
+        try:
+            b = page.locator(sel).first
+            if b.count():
+                b.click(timeout=800)
+        except Exception:
+            continue
+
+def publish_button_locator(page: Page):
+    sels = [
+        "[data-e2e='publish-button']",
+        "button:has-text('Publier')",
+        "button:has-text('Post')",
+        'button[type="submit"]',
+    ]
+    for sel in sels:
+        loc = page.locator(sel).first
+        if loc.count():
+            return loc
+    return page.locator("button:has-text('Publier')").first  # fallback
+
+def is_btn_enabled(btn) -> bool:
+    try:
+        if btn.count() == 0: return False
+        # attributs courants
+        if btn.get_attribute("disabled") is not None:
+            return False
+        if (btn.get_attribute("aria-disabled") or "").lower() == "true":
+            return False
+        cls = (btn.get_attribute("class") or "").lower()
+        if "disabled" in cls or "is-disabled" in cls:
+            return False
+        # sinon on considère cliquable
+        return True
+    except Exception:
+        return False
+
+def wait_processing_then_enable_publish(page: Page, max_wait_sec: int = 360):
+    """Attend la fin du traitement et l’activation du bouton."""
+    t0 = time.time()
+    btn = publish_button_locator(page)
+
+    # Boucle : tant que traitement visible OU bouton pas OK, on attend
+    while time.time() - t0 < max_wait_sec:
+        dismiss_small_blockers(page)
+        try:
+            btn.scroll_into_view_if_needed(timeout=1000)
+        except Exception:
+            pass
+
+        if not is_processing_visible(page) and is_btn_enabled(btn):
+            return True
+
+        time.sleep(2)
+
+    return False
+
+def click_publish(page: Page, max_wait_sec: int = 180) -> bool:
+    btn = publish_button_locator(page)
+    try:
+        btn.scroll_into_view_if_needed(timeout=1000)
+    except Exception:
+        pass
+
+    # attente finale que le bouton soit actif
+    t0 = time.time()
+    while time.time() - t0 < max_wait_sec:
+        dismiss_small_blockers(page)
+        if is_btn_enabled(btn):
+            try:
+                btn.click(timeout=1500)
+                log("[INFO] Clic 'Publier' ✅")
+                return True
+            except Exception:
+                # essai force
+                try:
+                    page.evaluate("(b)=>b.click()", btn.element_handle())
+                    log("[INFO] Clic forcé 'Publier' ✅")
+                    return True
+                except Exception:
+                    pass
+        time.sleep(1.5)
+
+    log("[WARN] Bouton 'Publier' non cliquable dans les temps.")
+    return False
+
+# --------------------------
+# Légende
 # --------------------------
 def fill_caption(page: Page, caption: str) -> bool:
     if not caption: return True
@@ -174,41 +297,12 @@ def fill_caption(page: Page, caption: str) -> bool:
                     loc.fill("")
                 except Exception:
                     ctx.evaluate("(el)=>{el.textContent=''; el.innerHTML='';}", loc.element_handle())
-                loc.type(caption, delay=15)
+                loc.type(caption, delay=12)
                 log("[INFO] Légende insérée.")
                 return True
             except Exception:
                 continue
     log("[WARN] Champ légende introuvable.")
-    return False
-
-def click_publish(page: Page, max_wait_sec: int = 180) -> bool:
-    publish_selectors = [
-        "button:has-text('Publier')",
-        "[data-e2e='publish-button']",
-        'button[type="submit"]',
-        'button[aria-label*="Publier"]',
-        "button:has-text('Post')",
-    ]
-    start = time.time()
-    time.sleep(2)
-    while time.time() - start < max_wait_sec:
-        for sel in publish_selectors:
-            try:
-                btn = page.locator(sel).first
-                if btn.count() == 0: continue
-                if btn.is_enabled(timeout=1000):
-                    btn.click(timeout=1000)
-                    log("[INFO] Clic 'Publier' ✅")
-                    return True
-                # fallback: clic forcé
-                page.evaluate("(b)=>b.click()", btn.element_handle())
-                log("[INFO] Clic forcé 'Publier' ✅")
-                return True
-            except Exception:
-                pass
-        time.sleep(2)
-    log("[WARN] Bouton 'Publier' non cliquable dans les temps.")
     return False
 
 # --------------------------
@@ -234,7 +328,6 @@ def run_once(play) -> bool:
 
     go_to_upload(page)
 
-    # si on vient d’injecter des cookies, petit reload
     if TIKTOK_COOKIE:
         page.reload(wait_until="domcontentloaded")
         try: page.wait_for_load_state("networkidle", timeout=12_000)
@@ -246,26 +339,30 @@ def run_once(play) -> bool:
         browser.close()
         return False
 
-    # Upload
     if not attach_video_via_filechooser(page, video_abs):
         log("[ERREUR] Impossible de localiser/déclencher l’upload (file chooser).")
         browser.close()
         return False
 
-    # Laisser TikTok ingérer le fichier
-    time.sleep(5)
+    # Laisser l’ingest démarrer
+    time.sleep(4)
 
-    # Légende
+    # Légende (peut rester grisée tant que traitement en cours: ok)
     fill_caption(page, CAPTION_TEXT)
 
+    # Attendre la fin du traitement ET l’activation du bouton
+    if not wait_processing_then_enable_publish(page, max_wait_sec=360):
+        log("[WARN] Traitement trop long ou bouton toujours inactif.")
+        browser.close()
+        return False
+
     if DRY_RUN:
-        log("[INFO] DRY_RUN=TRUE -> arrêt avant la publication.")
+        log("[INFO] DRY_RUN=TRUE -> arrêt avant publication.")
         browser.close()
         return True
 
-    # Publier
-    ok = click_publish(page, max_wait_sec=180)
-    time.sleep(3)
+    ok = click_publish(page, max_wait_sec=120)
+    time.sleep(2)
     browser.close()
     return ok
 
