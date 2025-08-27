@@ -47,11 +47,13 @@ jobs:
           python -m pip install playwright==1.46.0
           python -m playwright install --with-deps chromium
 
-      - name: Run agent
-        env:
-          ACCOUNT: ${{ github.event.inputs.ACCOUNT }}
-          POSTS_TO_PUBLISH: ${{ github.event.inputs.POSTS_TO_PUBLISH }}
-          DRY_RUN: ${{ github.event.inputs.DRY_RUN }}
-          TIKTOK_COOKIE: ${{ secrets.TIKTOK_COOKIE }}   # cookie 'sessionid' TikTok
-        run: |
-          python main.py
+    
+- name: Run agent
+  env:
+    ACCOUNT: ${{ github.event.inputs.ACCOUNT }}
+    POSTS_TO_PUBLISH: ${{ github.event.inputs.POSTS_TO_PUBLISH }}
+    DRY_RUN: ${{ github.event.inputs.DRY_RUN }}
+    TIKTOK_COOKIE: ${{ secrets.TIKTOK_COOKIE }}
+    TIKTOK_UA: ${{ secrets.TIKTOK_UA }}
+  run: |
+    python main.py
