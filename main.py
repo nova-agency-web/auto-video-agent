@@ -1,10 +1,9 @@
 # main.py
-import os
-import time
+import os, time
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-VIDEO_PATH = os.getenv("VIDEO_PATH", "assets/test.mp4")
+VIDEO_PATH   = os.getenv("VIDEO_PATH", "assets/test.mp4")
 CAPTION_TEXT = os.getenv("CAPTION", "Post auto vidéo automatique")
 COOKIE_RAW   = os.getenv("TIKTOK_COOKIE", "")
 UA_RAW       = os.getenv("TIKTOK_UA", "").strip()
@@ -20,30 +19,25 @@ def parse_cookie_string(cookie_str: str):
     cookie_str = (cookie_str or "").strip()
     if not cookie_str:
         return []
-    pairs = [p for p in cookie_str.split(";") if p.strip()]
-    cookies = []
-    for p in pairs:
-        if "=" not in p:
+    out = []
+    for p in cookie_str.split(";"):
+        p = p.strip()
+        if not p or "=" not in p: 
             continue
         k, v = p.split("=", 1)
         k = k.strip(); v = v.strip()
-        if not k or not v: 
-            continue
-        cookies.append({
-            "name": k,
-            "value": v,
-            "domain": ".tiktok.com",
-            "path": "/",
-            "httpOnly": False,
-            "secure": True,
-        })
-    return cookies
+        if k and v:
+            out.append({
+                "name": k, "value": v,
+                "domain": ".tiktok.com", "path": "/",
+                "httpOnly": False, "secure": True
+            })
+    return out
 
-def inject_cookies(context, cookie_raw: str):
-    cookies = parse_cookie_string(cookie_raw)
+def inject_cookies(context, raw):
+    cookies = parse_cookie_string(raw)
     if not cookies:
         raise RuntimeError("Impossible de parser TIKTOK_COOKIE (aucun cookie valide).")
-    # Un premier hit sur le domaine est requis avant add_cookies
     p = context.new_page()
     p.goto("https://www.tiktok.com", wait_until="domcontentloaded", timeout=60000)
     context.add_cookies(cookies)
@@ -53,151 +47,185 @@ def inject_cookies(context, cookie_raw: str):
 def goto_studio(page):
     page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90000)
     info("Navigation vers TikTok Studio Upload")
-    # L’app est SPA -> on attend qu’un composant d’upload apparaisse
-    # On attend un conteneur générique de l’uploader (div qui contient un input file)
-    try:
-        page.wait_for_selector('input[type="file"]', timeout=30000)
-    except PWTimeout:
-        # tente un reload une fois
-        page.reload(wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
+    # L’app est une SPA : laisse le temps aux modules de charger
+    page.wait_for_timeout(1500)
 
 def find_file_input_anywhere(page):
-    """
-    Cherche un <input type="file"> sur la page ET dans toutes les iframes.
-    Renvoie (frame_or_page, locator) ou (None, None) si introuvable.
-    """
-    selectors = [
+    sels = [
         'input[type="file"][accept*="video"]',
         'input[type="file"][accept*="mp4"]',
-        'input[type="file"]'
+        'input[type="file"]',
     ]
-
-    # 1) Essai sur la page principale
-    for sel in selectors:
-        loc = page.locator(sel)
-        if loc.count() > 0:
+    # page principale
+    for s in sels:
+        loc = page.locator(s)
+        if loc.count():
             return page, loc.first
-
-    # 2) Essai dans toutes les frames
-    for frame in page.frames:
+    # frames éventuelles
+    for fr in page.frames:
         try:
-            for sel in selectors:
-                loc = frame.locator(sel)
-                if loc.count() > 0:
-                    return frame, loc.first
+            for s in sels:
+                loc = fr.locator(s)
+                if loc.count():
+                    return fr, loc.first
         except Exception:
-            continue
-
+            pass
     return None, None
 
-def force_visible_and_upload(container, file_input, video_path):
-    # s’assure que l’élément existe dans le DOM
-    file_input.wait_for(state="attached", timeout=60000)
-
-    # le rendre visible (certains inputs sont hidden)
-    file_input.evaluate("""
+def force_visible_and_upload(container, input_loc, video_path):
+    input_loc.wait_for(state="attached", timeout=60000)
+    input_loc.evaluate("""
         (el) => {
           el.removeAttribute('hidden');
-          el.style.display   = 'block';
-          el.style.visibility= 'visible';
-          el.style.opacity   = '1';
-          el.style.position  = 'fixed';
-          el.style.left      = '0';
-          el.style.top       = '0';
-          el.style.width     = '1px';
-          el.style.height    = '1px';
-          el.disabled        = false;
+          el.style.display    = 'block';
+          el.style.visibility = 'visible';
+          el.style.opacity    = '1';
+          el.style.position   = 'fixed';
+          el.style.left       = '0';
+          el.style.top        = '0';
+          el.style.width      = '1px';
+          el.style.height     = '1px';
+          el.disabled         = false;
         }
     """)
-
     p = Path(video_path)
     if not p.exists():
         raise RuntimeError(f"Fichier vidéo introuvable: {p}")
-
-    file_input.set_input_files(str(p))
+    input_loc.set_input_files(str(p))
     info("Upload déclenché ✅")
 
-def fill_caption_and_scroll(page, caption: str):
-    # essaie quelques variantes usuelles du textarea
-    selectors = [
+def fill_caption(page, caption):
+    candidates = [
         'textarea[placeholder*="description" i]',
         'textarea[aria-label*="description" i]',
-        'textarea'
+        'textarea[placeholder*="titre" i]',
+        'textarea',
     ]
-    for sel in selectors:
-        loc = page.locator(sel)
+    for s in candidates:
+        loc = page.locator(s)
         try:
             loc.wait_for(state="visible", timeout=3000)
             loc.first.fill(caption)
             info("Légende insérée.")
-            break
-        except PWTimeout:
-            continue
+            return
         except Exception:
-            break
-
-    page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            continue
 
 def tick_compliance(page):
-    labels = [
-        "J'atteste", "J’accepte", "Conformité", "droits", "respecte"
-    ]
-    for txt in labels:
+    labels = ["J'atteste", "J’accepte", "Conformité", "droits", "respecte"]
+    for t in labels:
         try:
-            cb = page.get_by_role("checkbox", name=txt, exact=False)
-            if cb.count():
-                f = cb.first
-                if not f.is_checked():
-                    f.check(timeout=1500)
+            loc = page.get_by_role("checkbox", name=t, exact=False)
+            if loc.count():
+                cb = loc.first
+                if not cb.is_checked():
+                    cb.check(timeout=1000)
         except Exception:
             pass
 
-def try_publish(page):
-    names = ["Publier", "Post", "Publish"]
-    btn = None
-    for n in names:
-        loc = page.get_by_role("button", name=n, exact=False)
-        if loc.count():
-            btn = loc.first
-            break
-    if not btn:
-        warn("Bouton 'Publier' introuvable.")
-        return False
+def _candidate_publish_locators(scope):
+    # Multiples stratégies: nom i18n, data attrs, texte, rôle
+    texts = ["Publier", "Publish", "Post", "Poster"]
+    csss  = [
+        '[data-e2e*="publish"]',
+        '[data-e2e*="post"]',
+        '[data-testid*="publish"]',
+        'button:has-text("Publier")',
+        'button:has-text("Publish")',
+        'button:has-text("Post")',
+        'div[role="button"]:has-text("Publier")',
+        'div[role="button"]:has-text("Publish")',
+        'div[role="button"]:has-text("Post")',
+    ]
+    for t in texts:
+        yield scope.get_by_role("button", name=t, exact=False)
+    for sel in csss:
+        yield scope.locator(sel)
 
-    deadline = time.time() + 180  # jusqu’à 3 min
+def find_publish_anywhere(page):
+    # Page principale d'abord
+    for loc in _candidate_publish_locators(page):
+        try:
+            if loc.count():
+                return page, loc.first
+        except Exception:
+            pass
+    # Puis toutes les frames
+    for fr in page.frames:
+        for loc in _candidate_publish_locators(fr):
+            try:
+                if loc.count():
+                    return fr, loc.first
+            except Exception:
+                pass
+    return None, None
+
+def wake_and_scroll(page):
+    # Certaines UIs ne “réveillent” le footer qu’après scroll/interactions
+    page.mouse.wheel(0, 2000)
+    page.wait_for_timeout(500)
+    page.keyboard.press("End")
+    page.wait_for_timeout(500)
+    # petit click inoffensif
+    try:
+        page.mouse.click(10, 10)
+    except Exception:
+        pass
+
+def try_publish(page):
+    deadline = time.time() + 240  # 4 minutes max pour encodage + activation
+    last_seen = None
+
     while time.time() < deadline:
+        wake_and_scroll(page)
+
+        owner, btn = find_publish_anywhere(page)
+        if not btn:
+            # pas encore visible → laisse charger puis essaye un léger reload SPA
+            warn("Bouton 'Publier' introuvable pour l’instant…")
+            page.wait_for_timeout(2000)
+            continue
+
+        # mémorise pour debug
+        try:
+            last_seen = btn.text_content()
+        except Exception:
+            last_seen = "?"
+
+        # essaie de l’activer
         try:
             btn.scroll_into_view_if_needed(timeout=2000)
             aria_dis = btn.get_attribute("aria-disabled")
             dis_attr = btn.get_attribute("disabled")
-            if aria_dis in (None, "false") and dis_attr is None:
+            is_disabled = (aria_dis == "true") or (dis_attr is not None)
+
+            if not is_disabled:
                 if not DRY_RUN:
                     btn.click(timeout=3000)
                 info("Clic sur 'Publier' ✅")
                 return True
         except Exception:
             pass
-        page.wait_for_timeout(2000)
 
-    warn("Traitement trop long ou bouton toujours inactif.")
+        # Attends le traitement/validation côté TikTok
+        page.wait_for_timeout(3000)
+
+    warn(f"Bouton 'Publier' toujours inactif / non cliquable (dernier libellé: {last_seen}).")
     return False
 
 def main():
     info(f"Compte ciblé: {os.getenv('ACCOUNT','?')} | Posts: {os.getenv('POSTS_TO_PUBLISH','1')} | DRY_RUN={DRY_RUN}")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
         ctx_kwargs = {"locale":"fr-FR", "timezone_id":"Europe/Paris"}
         if UA_RAW:
             ctx_kwargs["user_agent"] = UA_RAW
-        context = p.chromium.launch().new_context() if False else browser.new_context(**ctx_kwargs)
+        context = browser.new_context(**ctx_kwargs)
 
         try:
             inject_cookies(context, COOKIE_RAW)
         except Exception as e:
-            err(str(e))
-            context.close(); browser.close()
-            raise SystemExit(1)
+            err(str(e)); context.close(); browser.close(); raise SystemExit(1)
 
         page = context.new_page()
         page.set_default_timeout(60000)
@@ -205,36 +233,36 @@ def main():
         try:
             goto_studio(page)
 
-            # boucle qui cherche l’input sur page/frames, avec un reload si nécessaire
-            deadline = time.time() + 120
+            # Recherche de l’input sur page/frames, avec patience
             found = None
+            deadline = time.time() + 120
             while time.time() < deadline and not found:
-                container, input_loc = find_file_input_anywhere(page)
-                if input_loc:
-                    found = (container, input_loc)
+                owner, inp = find_file_input_anywhere(page)
+                if inp:
+                    found = (owner, inp)
                     break
-                # parfois l’app recompose le DOM -> petit wait puis reload léger
                 page.wait_for_timeout(1000)
-                page.reload(wait_until="domcontentloaded")
 
             if not found:
                 raise RuntimeError("Impossible de localiser un champ fichier sur la page/frames.")
 
-            container, file_input = found
-            force_visible_and_upload(container, file_input, VIDEO_PATH)
-            fill_caption_and_scroll(page, CAPTION_TEXT)
+            owner, inp = found
+            force_visible_and_upload(owner, inp, VIDEO_PATH)
+
+            fill_caption(page, CAPTION_TEXT)
             tick_compliance(page)
+
             ok = try_publish(page)
             if not ok and not DRY_RUN:
                 raise SystemExit(1)
 
         except Exception as e:
-            err(str(e))
-            raise SystemExit(1)
+            err(str(e)); raise SystemExit(1)
         finally:
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1200)
             context.close()
             browser.close()
+
         info("Run terminé ✅")
 
 if __name__ == "__main__":
