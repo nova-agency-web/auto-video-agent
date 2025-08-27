@@ -2,7 +2,7 @@ name: Auto Video Agent
 
 on:
   schedule:
-    - cron: "0 */3 * * *"   # toutes les 3h
+    - cron: "0 */3 * * *"   # toutes les 3h (UTC)
   workflow_dispatch:
     inputs:
       ACCOUNT:
@@ -10,13 +10,13 @@ on:
         required: true
         default: "trucs-malins"
       POSTS_TO_PUBLISH:
-        description: "Nombre de posts à publier"
+        description: "Nombre de publications à poster"
         required: true
-        default: "2"
+        default: "1"
       DRY_RUN:
         description: "true = simulation, false = publication réelle"
         required: true
-        default: "true"
+        default: "false"
 
 jobs:
   run:
@@ -33,14 +33,16 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+
       - name: Install Playwright browsers
         run: |
           python -m playwright install --with-deps chromium
+
       - name: Run agent
         env:
           ACCOUNT: ${{ github.event.inputs.ACCOUNT }}
           POSTS_TO_PUBLISH: ${{ github.event.inputs.POSTS_TO_PUBLISH }}
           DRY_RUN: ${{ github.event.inputs.DRY_RUN }}
-          # TIKTOK_COOKIE: ${{ secrets.TIKTOK_COOKIE }}   # à brancher quand prêt
+          TIKTOK_COOKIE: ${{ secrets.TIKTOK_COOKIE }}   # <-- cookie 'sessionid' que tu as ajouté en secret
         run: |
           python main.py
