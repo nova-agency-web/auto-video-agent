@@ -1,230 +1,305 @@
 # main.py
-# Publie une vidéo TikTok via TikTok Studio en utilisant un en-tête Cookie brut.
-# Variables d'env attendues (déjà posées par ton workflow):
-# - ACCOUNT           (string) : nom logique du compte (log uniquement)
-# - POSTS_TO_PUBLISH  (int)    : nombre de posts à faire (on fait 1 par run)
-# - DRY_RUN           (TRUE/FALSE)
-# - TIKTOK_COOKIE     (string) : **chaîne Cookie complète** copiée de DevTools
-# - TIKTOK_UA         (string) : User-Agent de ton Chrome (facultatif)
-#
-# Vidéo : assets/test.mp4 (ou change VIDEO_PATH ci-dessous)
-
-import os
-import sys
-import time
+import os, json, time, re, sys
 from pathlib import Path
+from typing import List, Optional
+from playwright.sync_api import sync_playwright, Browser, Page, expect
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-# ---------- Config ----------
-VIDEO_PATH = Path("assets/test.mp4")            # Chemin vidéo par défaut
-STUDIO_URLS = [
-    "https://www.tiktok.com/tiktokstudio/upload",  # Studio
-    "https://www.tiktok.com/upload",               # Uploader “classique”
-]
-CAPTION_TEXT = "Post automatisé ✅ #auto"        # Légende par défaut
-FILE_INPUT_SELECTOR = 'input[type="file"]'       # input caché (on forcera)
-PUBLISH_BUTTON_TEXTS = ["Publier", "Post", "Publish"]  # Sélecteurs de secours
-CAPTION_CANDIDATES = [
-    'textarea[placeholder*="légende"]',
-    'textarea[placeholder*="Légende"]',
-    'textarea[placeholder*="caption"]',
-    '[data-e2e="caption"] textarea',
-    '[data-e2e="caption"]',
-    'textarea',
-]
-# ---------- Helpers ----------
-
-def env_bool(name: str, default=False):
-    val = os.getenv(name, "")
-    if isinstance(val, bool):
-        return val
-    val = (val or "").strip().lower()
-    if val in ("1", "true", "vrai", "yes", "y", "on"):
-        return True
-    if val in ("0", "false", "faux", "no", "n", "off"):
-        return False
-    return default
-
-def die(msg: str, code: int = 1):
-    print(f"[ERREUR] {msg}")
-    sys.exit(code)
-
-def info(msg: str):
-    print(f"[INFO] {msg}")
-
-def warn(msg: str):
-    print(f"[WARN] {msg}")
-
-# ---------- Entrée ----------
+# --------------------------
+# Config lecture ENV
+# --------------------------
 ACCOUNT = os.getenv("ACCOUNT", "trucs→malins")
-POSTS_TO_PUBLISH = int(os.getenv("POSTS_TO_PUBLISH", "1") or "1")
-DRY_RUN = env_bool("DRY_RUN", False)
-COOKIE_RAW = os.getenv("TIKTOK_COOKIE", "") or ""
-UA_RAW = os.getenv("TIKTOK_UA", "").strip()
+POSTS_TO_PUBLISH = int(os.getenv("POSTS_TO_PUBLISH", "1"))
+DRY_RUN = os.getenv("DRY_RUN", "FALSE").strip().upper() == "TRUE"
+TIKTOK_COOKIE = os.getenv("TIKTOK_COOKIE", "").strip()  # string JSON (clé=valeur) ou lignes "clé=valeur"
+TIKTOK_UA = os.getenv("TIKTOK_UA", "").strip()
 
-print(f"[INFO] Compte ciblé: {ACCOUNT} | Posts: {POSTS_TO_PUBLISH} | DRY_RUN={DRY_RUN}")
+VIDEO_PATH = os.getenv("VIDEO_PATH", "assets/test.mp4")
+CAPTION_TEXT = os.getenv("CAPTION_TEXT", "Post upload vidéo automatique")
+UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload"
 
-# Validation cookie brut : on vérifie juste que ça ressemble à "k=v; k2=v2"
-if not COOKIE_RAW or ("=" not in COOKIE_RAW) or (";" not in COOKIE_RAW):
-    die("Impossible de parser TIKTOK_COOKIE (chaîne vide ou sans point-virgule). "
-        "Colle **la valeur entière** de l'en-tête 'Cookie' depuis DevTools (onglet Network ➜ une requête vers tiktok.com ➜ Headers ➜ Request Headers ➜ Cookie).")
+# --------------------------
+# Utilitaires
+# --------------------------
+def log(msg: str):
+    print(msg, flush=True)
 
-# Petit check : au moins un identifiant de session courant
-if not any(key in COOKIE_RAW for key in ("sessionid", "sid_tt", "ssid_ucp_v1", "sessionid_ss")):
-    warn("TIKTOK_COOKIE ne contient aucun des marqueurs ['sessionid','sid_tt','ssid_ucp_v1','sessionid_ss'] — il se peut qu'il soit expiré.")
-
-if not VIDEO_PATH.exists():
-    die(f"Fichier vidéo introuvable: {VIDEO_PATH}. Place un MP4 dans {VIDEO_PATH}")
-
-if DRY_RUN:
-    info("Mode DRY_RUN actif — aucun clic de publication ne sera effectué.")
-
-# ---------- Publication ----------
-def open_studio_and_upload(page):
+def parse_cookie_blob(blob: str) -> List[dict]:
     """
-    Ouvre une des URLs Studio et envoie le fichier dans l'input caché.
-    Retourne True si l'upload a pu être déclenché.
+    Accepte:
+      - JSON: {"sessionid":"...","msToken":"..."}
+      - Texte: lignes "nom=valeur"
+    Retourne un tableau [{name, value, domain, path, httpOnly, secure, sameSite}]
     """
-    last_err = None
-    for url in STUDIO_URLS:
-        info(f"[NAV] Vers {url}")
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-            # Attends que la page soit stabilisée un minimum
-            page.wait_for_timeout(1000)
+    cookies = []
+    if not blob:
+        return cookies
 
-            # L'input est caché: on l'attrape même s'il n'est pas visible, puis on force set_input_files
-            file_input = page.locator(FILE_INPUT_SELECTOR).first
-            file_input.wait_for(state="attached", timeout=15_000)
-            info("Sélection champ fichier…")
-            file_input.set_input_files(str(VIDEO_PATH), timeout=60_000)
-            info("Upload déclenché ✅")
-            return True
-        except PWTimeout as e:
-            last_err = e
-            warn(f"Timeout sur {url}: {e}")
-        except Exception as e:
-            last_err = e
-            warn(f"Echec sur {url}: {e}")
-    if last_err:
-        raise last_err
-    return False
+    def base_cookie(name, value):
+        return {
+            "name": name,
+            "value": value,
+            "domain": ".tiktok.com",
+            "path": "/",
+            "httpOnly": False,
+            "secure": True,
+            "sameSite": "Lax",
+        }
 
-def try_fill_caption(page, caption: str):
-    for sel in CAPTION_CANDIDATES:
+    # JSON ?
+    try:
+        data = json.loads(blob)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if v is None:
+                    continue
+                cookies.append(base_cookie(k, str(v)))
+            return cookies
+        elif isinstance(data, list):
+            # déjà une liste de cookies Playwright ?
+            for c in data:
+                if "name" in c and "value" in c:
+                    # complétion domaine / chemin si absents
+                    c.setdefault("domain", ".tiktok.com")
+                    c.setdefault("path", "/")
+                    c.setdefault("secure", True)
+                    c.setdefault("httpOnly", False)
+                    c.setdefault("sameSite", "Lax")
+                    cookies.append(c)
+            return cookies
+    except Exception:
+        pass
+
+    # sinon: lignes nom=valeur; séparateurs ; ou \n
+    parts = re.split(r"[;\n]+", blob)
+    for p in parts:
+        p = p.strip()
+        if not p or "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k or not v:
+            continue
+        cookies.append(base_cookie(k, v))
+    return cookies
+
+def attach_video(page: Page, file_path: str) -> bool:
+    """
+    Tente plusieurs sélecteurs d'input file et set_input_files.
+    """
+    selectors = [
+        'input[type="file"][accept*="video"]',
+        'input[type="file"]',
+        '[data-e2e="upload-video"] input[type="file"]',
+        # fallback: bouton "Sélectionner une vidéo" -> son input
+        # on clique d'abord le bouton si présent
+    ]
+
+    # Essai clic sur CTA "Sélectionner une vidéo"
+    try:
+        btn = page.locator("button:has-text('Sélectionner une vidéo')")
+        if btn.count() > 0:
+            btn.first.click(timeout=3000)
+            time.sleep(0.5)
+    except Exception:
+        pass
+
+    for sel in selectors:
         try:
-            el = page.locator(sel).first
-            el.wait_for(state="attached", timeout=5_000)
-            # Certaines zones ont besoin d'un clic avant fill
-            try:
-                el.click(timeout=2_000)
-            except Exception:
-                pass
-            el.fill(caption, timeout=5_000)
-            info("Légende insérée.")
+            file_input = page.locator(sel).first
+            file_input.wait_for(state="visible", timeout=5000)
+            file_input.set_input_files(file_path)
+            log("[INFO] Upload déclenché ✅")
             return True
         except Exception:
             continue
-    warn("Avertissement: impossible de remplir la légende (textarea non trouvé).")
     return False
 
-def try_click_publish(page):
-    if DRY_RUN:
-        info("DRY_RUN=True ➜ on ne clique pas sur 'Publier'.")
+def fill_caption(page: Page, caption: str) -> bool:
+    """
+    Remplit la légende en essayant plusieurs cibles: textarea, contenteditable, data-e2e…
+    """
+    if not caption:
         return True
-    # Plusieurs variantes possibles selon langue/AB-test
-    for label in PUBLISH_BUTTON_TEXTS:
-        try:
-            # Essaye un bouton textuel
-            btn = page.get_by_role("button", name=label).first
-            btn.wait_for(state="visible", timeout=8_000)
-            page.evaluate("el => el.scrollIntoView({block:'center'})", btn.element_handle())
-            btn.click(timeout=8_000)
-            info("Bouton 'Publier' cliqué.")
-            return True
-        except Exception:
-            # Essaye via texte brut
+
+    targets = [
+        "textarea",
+        '[data-e2e="video-caption"]',
+        '[data-e2e="caption-input"]',
+        'div[contenteditable="true"]',
+        'div[role="textbox"]',
+    ]
+
+    # parfois le champ est dans un iframe studio: on tente la page d'abord, puis iframes
+    contexts = [page]
+    contexts.extend(page.frames)
+
+    for ctx in contexts:
+        for sel in targets:
             try:
-                btn2 = page.locator(f"button:has-text('{label}')").first
-                btn2.wait_for(state="attached", timeout=5_000)
-                page.evaluate("el => el.scrollIntoView({block:'center'})", btn2.element_handle())
-                btn2.click(timeout=5_000, force=True)
-                info("Bouton 'Publier' cliqué (fallback).")
+                loc = ctx.locator(sel).first
+                loc.wait_for(state="visible", timeout=4000)
+                # clear + type
+                try:
+                    loc.fill("")  # si c'est un textarea/input
+                except Exception:
+                    # contenteditable
+                    ctx.evaluate(
+                        """(el)=>{el.innerHTML=''; el.textContent='';}""",
+                        loc.element_handle()
+                    )
+                # type doucement
+                loc.type(caption, delay=15)
+                log("[INFO] Légende insérée.")
                 return True
             except Exception:
                 continue
-    warn("Avertissement: bouton 'Publier' non cliquable/détecté.")
     return False
 
+def click_publish(page: Page, max_wait_sec: int = 180) -> bool:
+    """
+    Attend que le bouton Publier devienne cliquable, puis clique. Réessaye jusqu'à max_wait_sec.
+    """
+    publish_selectors = [
+        "button:has-text('Publier')",
+        '[data-e2e="publish-button"]',
+        'button[type="submit"]',
+        'button[aria-label*="Publier"]',
+    ]
 
-def publish_once(pw):
-    # Crée le navigateur avec User-Agent et **Cookie header** global
-    launch_opts = dict(headless=True, args=["--disable-dev-shm-usage"])
-    browser = pw.chromium.launch(**launch_opts)
+    start = time.time()
+    # Attente initiale (traitement vidéo)
+    time.sleep(3)
 
-    # Construit les en-têtes — on injecte **Cookie brut** ici
-    headers = {"cookie": COOKIE_RAW}
-    context_opts = {
-        "extra_http_headers": headers,
-        "ignore_https_errors": True,
-        "viewport": {"width": 1366, "height": 768},
-        "timezone_id": "Europe/Paris",
-        "locale": "fr-FR",
-    }
-    if UA_RAW:
-        context_opts["user_agent"] = UA_RAW
+    while time.time() - start < max_wait_sec:
+        for sel in publish_selectors:
+            try:
+                btn = page.locator(sel).first
+                # on vérifie existence, visibilité et état enabled
+                if btn.count() > 0:
+                    # parfois visible mais disabled -> on évalue disabled
+                    try:
+                        if btn.is_enabled(timeout=1000):
+                            btn.click(timeout=1000)
+                            log("[INFO] Clic sur 'Publier' ✅")
+                            return True
+                    except Exception:
+                        pass
+                    # forcer le clic (quelques sites le permettent)
+                    try:
+                        page.evaluate("(b)=>b.click()", btn.element_handle())
+                        log("[INFO] Clic forcé sur 'Publier' ✅")
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        time.sleep(2)
+    return False
 
-    context = browser.new_context(**context_opts)
+def go_to_upload(page: Page):
+    page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=60_000)
+    # Si TikTok redirige vers login, l’UI reste accessible si session OK. On laisse charger:
+    try:
+        page.wait_for_load_state("networkidle", timeout=20_000)
+    except Exception:
+        pass
+    log(f"[INFO] [NAV] Vers {UPLOAD_URL}")
+
+def inject_cookies(context, cookie_blob: str):
+    cookies = parse_cookie_blob(cookie_blob)
+    if not cookies:
+        log("[WARN] Aucun cookie fourni (ou non valide). On continue sans injection.")
+        return
+    try:
+        context.add_cookies(cookies)
+        log(f"[INFO] Injection cookies ({len(cookies)} entrées)…")
+    except Exception as e:
+        log(f"[WARN] Cookies ignorés (invalides pour DevTools): {e}")
+
+def main_once(play: "Playwright") -> bool:
+    browser_args = [
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-web-security",
+        "--disable-blink-features=AutomationControlled",
+    ]
+
+    chromium = play.chromium
+    browser: Browser = chromium.launch(headless=True, args=browser_args)
+    ctx_kwargs = {}
+    if TIKTOK_UA:
+        ctx_kwargs["user_agent"] = TIKTOK_UA
+
+    context = browser.new_context(**ctx_kwargs)
     page = context.new_page()
 
-    try:
-        ok_upload = open_studio_and_upload(page)
-        if not ok_upload:
-            die("Impossible de démarrer l’upload (input file introuvable).")
+    # cookies avant navigation si on en a
+    if TIKTOK_COOKIE:
+        inject_cookies(context, TIKTOK_COOKIE)
 
-        # Attends quelques secondes que TikTok traite le fichier
-        page.wait_for_timeout(5_000)
+    go_to_upload(page)
 
-        try_fill_caption(page, CAPTION_TEXT)
-
-        # Selon l’UI, attendre que l’upload/wrapping se termine (optionnel)
-        # On surveille un indicateur d’état s’il existe, sinon on continue.
-        # (On évite d’être trop strict pour ne pas replanter.)
+    # (re)charger la page après cookies si besoin
+    if TIKTOK_COOKIE:
+        page.reload(wait_until="domcontentloaded")
         try:
-            # Exemples d’indicateurs (ajuste si tu en vois un stable)
-            selectors_done = [
-                'text=Téléversement réussi',
-                'text=Traitement terminé',
-                '[data-e2e="post-ready"]',
-            ]
-            for s in selectors_done:
-                page.wait_for_selector(s, timeout=8_000)
-                info(f"Indicateur détecté: {s}")
-                break
+            page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
             pass
 
-        try_click_publish(page)
-
-        # Attendre un peu pour capter les éventuels toasts de succès
-        page.wait_for_timeout(5_000)
-
-        return True
-    finally:
-        context.close()
+    # Vérif fichier
+    video_abs = str(Path(VIDEO_PATH).resolve())
+    if not Path(video_abs).exists():
+        log(f"[ERREUR] Fichier vidéo introuvable: {video_abs}")
         browser.close()
+        return False
+
+    # Sélection champ file + upload
+    if not attach_video(page, video_abs):
+        log("[ERREUR] Impossible de localiser le champ fichier (input[type='file']).")
+        browser.close()
+        return False
+
+    # Attendre un peu que TikTok ingère le fichier
+    time.sleep(5)
+
+    # Remplir légende (best-effort)
+    if not fill_caption(page, CAPTION_TEXT):
+        log("[WARN] Avertissement: impossible de remplir la légende (textarea non trouvé).")
+
+    # Si DRY_RUN, on s'arrête avant la publication
+    if DRY_RUN:
+        log("[INFO] DRY_RUN=TRUE -> arrêt avant publication.")
+        browser.close()
+        return True
+
+    # Attendre traitement + bouton Publier
+    if not click_publish(page, max_wait_sec=180):
+        log("[WARN] Avertissement: bouton 'Publier' non cliquable/détecté.")
+        browser.close()
+        return False
+
+    # Laisser le temps à TikTok de répondre
+    time.sleep(4)
+    browser.close()
+    return True
 
 
 def main():
-    print("— Post 1/1 —")
-    with sync_playwright() as pw:
-        ok = publish_once(pw)
-        if not ok:
-            die("Publication échouée.")
-
-    print("Run terminé ✅")
-
+    log(f"[INFO] Compte ciblé: {ACCOUNT} | Posts: {POSTS_TO_PUBLISH} | DRY_RUN={DRY_RUN}")
+    ok_all = True
+    with sync_playwright() as p:
+        for i in range(POSTS_TO_PUBLISH):
+            log(f"[INFO] — Post {i+1}/{POSTS_TO_PUBLISH} —")
+            try:
+                ok = main_once(p)
+                if not ok:
+                    ok_all = False
+            except Exception as e:
+                log(f"[ERREUR] Exception pendant la publication: {e}")
+                ok_all = False
+    if not ok_all:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
