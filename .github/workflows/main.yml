@@ -1,27 +1,30 @@
-name: courir
+name: Agent vidéo automatique
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * *" # facultatif : tous les jours à 06:00 UTC
-
-permissions:
-  contents: read
+    inputs:
+      video_path:
+        description: "Chemin vers la vidéo à publier"
+        required: false
+        default: "assets/test.mp4"
 
 jobs:
   courir:
     runs-on: ubuntu-latest
 
+    # Variables d’environnement pour l’exécution
     env:
-      ACCOUNT: ${{ vars.ACCOUNT || 'trucs-malins' }}
-      POSTS_TO_PUBLISH: ${{ vars.POSTS_TO_PUBLISH || '1' }}
-      DRY_RUN: ${{ vars.DRY_RUN || 'False' }}
-      # Secrets à définir dans Settings > Secrets and variables > Actions
+      # Chemin vidéo saisi à l’exécution (fallback sur la valeur par défaut)
+      VIDEO_PATH: ${{ github.event.inputs.video_path || 'assets/test.mp4' }}
+      # Cookies TikTok en JSON (définis dans les Secrets du repo)
       TIKTOK_COOKIE: ${{ secrets.TIKTOK_COOKIE }}
-      TIKTOK_UA: ${{ secrets.TIKTOK_UA }}
+      # Divers
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
+      PLAYWRIGHT_BROWSERS_PATH: "0"
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -29,69 +32,26 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Upgrade pip + install deps
+      - name: Installer dépendances Python + Playwright
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install Playwright + Chromium (same interpreter)
-        run: |
+          # Si requirements.txt existe, on l’installe (sinon on ignore sans échec)
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          pip install playwright
           python -m playwright install --with-deps chromium
 
-      # (Optionnel) Nettoyage d’anciens artefacts locaux
-      - name: Prepare trace folder
-        run: |
-          rm -rf trace playwright-report || true
-          mkdir -p trace
+      - name: Exécuter l’agent
+        run: python main.py
 
-      - name: Run agent
-        id: run_agent
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "### Lancement de main.py" >> $GITHUB_STEP_SUMMARY
-          python main.py
-        # Si ton script génère une trace Playwright, garde le "if: always()" ci-dessous pour upload
-
-      # ─────────────────────────────────────────────
-      #  UPLOAD DES ARTEFACTS (version v4 obligatoire)
-      # ─────────────────────────────────────────────
-
-      - name: Zip trace folder (if exists)
-        if: always()
-        run: |
-          if [ -d "trace" ]; then
-            (cd trace && zip -9 -r ../trace.zip .) || true
-          fi
-          if [ -d "playwright-report" ]; then
-            (cd playwright-report && zip -9 -r ../playwright-report.zip .) || true
-          fi
-
-      - name: Upload Playwright trace (always)
+      # Artefacts utiles pour déboguer (compatibles v4)
+      - name: Déposer artefacts (logs/captures) si présents
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trace
-          path: trace.zip
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload Playwright HTML report (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report
-          path: playwright-report.zip
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload logs (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: run-logs
+          name: agent-output
           path: |
-            **/*.log
-            logs/**
+            logs/
+            traces/
+            playwright-report/
+            **/*.png
           if-no-files-found: ignore
-          retention-days: 7
