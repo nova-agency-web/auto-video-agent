@@ -9,37 +9,24 @@ from typing import List, Dict, Any, Optional
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Réglages principaux (→ adapté pour assets/test.mp4)
+# Réglages principaux
 # ──────────────────────────────────────────────────────────────────────────────
 ACCOUNT = os.getenv("ACCOUNT", "default")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 POSTS_TO_PUBLISH = int(os.getenv("POSTS_TO_PUBLISH", "1"))
 
-# >>> ICI le chemin de la vidéo dans le dépôt GitHub :
-VIDEO_PATH = Path("assets/test.mp4")             # ⟵ CHANGÉ
-CAPTION_TEXT = os.getenv("CAPTION_TEXT", "")     # optionnel
+VIDEO_PATH = Path("assets/test.mp4")            # ← ta vidéo dans le repo
+CAPTION_TEXT = os.getenv("CAPTION_TEXT", "")
 
-# Secrets (GH Actions → Settings → Secrets and variables → Actions)
-COOKIE_RAW = os.getenv("TIKTOK_COOKIE", "")      # attendu: JSON array de cookies [{...}, ...]
-UA_RAW = os.getenv("TIKTOK_UA", "")              # user-agent (string)
+COOKIE_RAW = os.getenv("TIKTOK_COOKIE", "")     # JSON array de cookies
+UA_RAW = os.getenv("TIKTOK_UA", "")             # user-agent optionnel
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
+def log(msg: str) -> None: print(msg, flush=True)
+def warn(msg: str) -> None: print(f"[WARN] {msg}", flush=True)
+def info(msg: str) -> None: print(f"[INFO] {msg}", flush=True)
 def fail(msg: str) -> None:
     print(f"[ERREUR] {msg}", flush=True)
     sys.exit(1)
-
-def warn(msg: str) -> None:
-    print(f"[WARN] {msg}", flush=True)
-
-def info(msg: str) -> None:
-    print(f"[INFO] {msg}", flush=True)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Cookies
@@ -56,15 +43,27 @@ WantedCookieNames = {
     "odin_tt",
 }
 
+def _normalize_same_site(v: Any) -> str:
+    s = (str(v) if v is not None else "").strip().lower()
+    if s in ("lax", "strict", "none"):
+        return s.capitalize()  # Lax/Strict/None
+    return "Lax"
+
+def _coerce_expires(v: Any) -> Optional[int]:
+    """
+    - Si v est un int/float -> int(v)
+    - Si v est un str numérique -> int(v)
+    - Sinon -> None (et on supprimera la clé)
+    """
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        vs = v.strip()
+        if vs.isdigit():
+            return int(vs)
+    return None
+
 def parse_cookie_secret(raw: str) -> List[Dict[str, Any]]:
-    """
-    Accepte un JSON array de cookies au format:
-    [
-      {"name":"...","value":"...","domain":"tiktok.com",".path":"/","secure":true,"httpOnly":false,"sameSite":"Lax","expires": 1761472716},
-      ...
-    ]
-    On filtre et on convertit pour Playwright BrowserContext.add_cookies.
-    """
     if not raw.strip():
         return []
 
@@ -76,65 +75,50 @@ def parse_cookie_secret(raw: str) -> List[Dict[str, Any]]:
     if not isinstance(parsed, list):
         fail("TIKTOK_COOKIE doit être un JSON array de cookies.")
 
-    mapped = []
+    mapped: List[Dict[str, Any]] = []
     for c in parsed:
         try:
-            name = c.get("name") or c.get("Name")
-            value = c.get("value") or c.get("Value")
+            name   = c.get("name")   or c.get("Name")
+            value  = c.get("value")  or c.get("Value")
             domain = c.get("domain") or c.get("Domain")
-            path = c.get("path") or c.get("Path") or "/"
-
+            path   = c.get("path")   or c.get("Path") or "/"
             if not name or not value or not domain:
                 continue
-
-            # Filtre: on garde seulement les cookies utiles / valides
             if name not in WantedCookieNames:
                 continue
 
-            same_site = (c.get("sameSite") or c.get("SameSite") or "").lower()
-            if same_site in ("lax", "strict", "none"):
-                ss = same_site.capitalize()
-            else:
-                ss = "Lax"  # défaut
-
-            expires = c.get("expires") or c.get("Expires")
-            # Playwright accepte un int (seconds since epoch) ou None
-            if isinstance(expires, (int, float)):
-                expires_val = int(expires)
-            else:
-                expires_val = None
-
-            mapped.append({
+            cookie: Dict[str, Any] = {
                 "name": name,
                 "value": value,
                 "domain": domain,
                 "path": path,
                 "httpOnly": bool(c.get("httpOnly", c.get("HttpOnly", False))),
-                "secure": bool(c.get("secure", c.get("Secure", True))),
-                "sameSite": ss,      # "Lax" | "Strict" | "None"
-                "expires": expires_val
-            })
+                "secure":   bool(c.get("secure",   c.get("Secure",   True))),
+                "sameSite": _normalize_same_site(c.get("sameSite") or c.get("SameSite")),
+            }
+
+            # expires: on ne l'ajoute QUE s'il est strictement numérique
+            exp_raw = c.get("expires") or c.get("Expires")
+            exp_num = _coerce_expires(exp_raw)
+            if exp_num is not None:
+                cookie["expires"] = exp_num
+            # sinon on n'ajoute pas la clé 'expires' (évite l'erreur Playwright)
+
+            mapped.append(cookie)
         except Exception:
             continue
 
     return mapped
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Sélecteurs robustes + actions
+# UI helpers
 # ──────────────────────────────────────────────────────────────────────────────
 STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload"
 
 def find_file_chooser_button(page) -> Optional[Any]:
-    """
-    Essaye plusieurs variantes de boutons/inputs d'upload.
-    """
     candidates = [
-        # input direct
         "input[type='file'][accept*='video']",
         "input[type='file']",
-
-        # boutons qui ouvrent l'input
         "[data-e2e='upload-button']",
         "[data-e2e='file-select']",
         "[data-testid='upload-btn']",
@@ -152,14 +136,10 @@ def find_file_chooser_button(page) -> Optional[Any]:
     return None
 
 def attach_file_direct_if_possible(page, video_path: Path) -> bool:
-    """
-    Essaye de repérer un <input type=file> visible et d'y attacher la vidéo.
-    """
     try:
         inp = page.locator("input[type='file']")
         if inp.count() == 0:
             return False
-        # On cherche un input acceptant la vidéo
         for i in range(inp.count()):
             el = inp.nth(i)
             try:
@@ -173,36 +153,24 @@ def attach_file_direct_if_possible(page, video_path: Path) -> bool:
         return False
 
 def wait_upload_ready(page, timeout_ms: int = 120_000) -> None:
-    """
-    Attend des marqueurs plausibles de fin d'upload/analyse (à adapter si besoin).
-    """
-    # Plusieurs signaux possibles, on en accepte un des deux
-    # 1) Disparition d'un indicateur de progression
-    # 2) Apparition d’un bouton/label "Publier" ou section des options
     candidates = [
         "button:has-text('Publier')",
         "button:has-text('Post')",
         "[data-e2e='publish-button']",
-        "text=Confidentialité",     # section des paramètres visibles
-        "text=Description",         # zone de légende visible
+        "text=Confidentialité",
+        "text=Description",
     ]
-    with page.expect_console_message(timeout=timeout_ms) as maybe:
-        # On ne compte pas vraiment sur les logs; on attend plutôt le DOM ci-dessous
-        pass
     for sel in candidates:
         try:
             page.locator(sel).first.wait_for(state="visible", timeout=timeout_ms)
             return
         except PWTimeout:
             continue
-    # Dernier essai: petit sleep en plus si rien de visible (tolérance)
     page.wait_for_timeout(2000)
-
 
 def fill_caption_if_present(page, caption: str) -> None:
     if not caption.strip():
         return
-    # Divers sélecteurs plausibles pour la zone description
     selectors = [
         "textarea[placeholder*='description']",
         "textarea[placeholder*='Description']",
@@ -235,16 +203,11 @@ def scroll_into_view_and_click(page, locator_str: str, retries: int = 80) -> boo
     return False
 
 def publish_now(page) -> bool:
-    """
-    Essaie de cliquer le bouton 'Publier' avec pas mal de tolérance.
-    """
     labels = [
         "button:has-text('Publier')",
         "button:has-text('Post')",
         "[data-e2e='publish-button']",
     ]
-
-    # Essai direct
     for sel in labels:
         try:
             ok = scroll_into_view_and_click(page, sel, retries=60)
@@ -252,8 +215,6 @@ def publish_now(page) -> bool:
                 return True
         except Exception:
             pass
-
-    # Fallback: fouille tout le DOM à la recherche d’un bouton activable
     try:
         buttons = page.locator("button")
         for i in range(min(buttons.count(), 200)):
@@ -268,10 +229,8 @@ def publish_now(page) -> bool:
                 continue
     except Exception:
         pass
-
     warn("Bouton 'Publier' toujours inactif / non cliquable après délais.")
     return False
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flux principal
@@ -292,7 +251,6 @@ def publish_once(cookie_raw: str, caption: str, video_path: Path, ua_raw: str) -
             context_args["user_agent"] = ua_raw.strip()
         context = browser.new_context(**context_args)
 
-        # Ajout cookies
         info(f"Injection cookies ({len(cookies)} entrées)…")
         try:
             context.add_cookies(cookies)
@@ -300,13 +258,11 @@ def publish_once(cookie_raw: str, caption: str, video_path: Path, ua_raw: str) -
             fail(f"BrowserContext.add_cookies: {e}")
 
         page = context.new_page()
-        info(f"[NAV] Vers TikTok Studio Upload")
-        page.goto(STUDIO_URL, wait_until="domcontentloaded")
+        info("[NAV] Vers TikTok Studio Upload")
+        page.goto("https://www.tiktok.com/tiktokstudio/upload", wait_until="domcontentloaded")
 
-        # Tente input direct d'abord
         attached = attach_file_direct_if_possible(page, video_path)
         if not attached:
-            # Sinon, clique un bouton qui ouvre le file chooser
             btn = find_file_chooser_button(page)
             if not btn:
                 fail("Bouton pour ouvrir le file chooser introuvable.")
@@ -320,17 +276,14 @@ def publish_once(cookie_raw: str, caption: str, video_path: Path, ua_raw: str) -
                 fail(f"Impossible de fournir le fichier via 'file chooser': {e}")
 
         info("Upload déclenché ✅")
-
-        # Attente fin d’upload
         wait_upload_ready(page, timeout_ms=180_000)
 
-        # Légende (optionnel)
         if caption.strip():
             try:
                 fill_caption_if_present(page, caption.strip())
                 info("Légende insérée.")
             except Exception:
-                warn("Avertissement: impossible de remplir la légende (textarea non trouvé).")
+                warn("Impossible de remplir la légende (textarea non trouvé).")
 
         if DRY_RUN:
             info("Publication tentée (DRY_RUN=True).")
@@ -338,22 +291,17 @@ def publish_once(cookie_raw: str, caption: str, video_path: Path, ua_raw: str) -
             browser.close()
             return True
 
-        # Publier maintenant
         ok = publish_now(page)
         context.close()
         browser.close()
         return ok
 
-
 def main() -> None:
-    # Vérifs de base
     if not VIDEO_PATH.exists():
         fail(f"Vidéo introuvable : {VIDEO_PATH.resolve()}")
-
     if not COOKIE_RAW.strip():
         fail("TIKTOK_COOKIE vide / non défini.")
 
-    # On peut poster plusieurs vidéos si besoin via POSTS_TO_PUBLISH
     success = 0
     for i in range(POSTS_TO_PUBLISH):
         info(f"— Post {i+1} / {POSTS_TO_PUBLISH} —")
@@ -363,11 +311,9 @@ def main() -> None:
                 success += 1
         except Exception as e:
             fail(str(e))
-
     info(f"Run terminé ✅ ({success}/{POSTS_TO_PUBLISH} réussis)")
     if success == 0:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
