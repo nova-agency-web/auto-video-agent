@@ -1,45 +1,30 @@
 name: Agent vidéo automatique
 
 on:
-  # Déclenchement manuel avec paramètres
   workflow_dispatch:
     inputs:
       ACCOUNT:
-        description: "Compte cible (ex: trucs-malins)"
-        required: true
+        description: "Compte ciblé (libre)"
+        required: false
         default: "trucs-malins"
       POSTS_TO_PUBLISH:
-        description: "Nombre de publications à effectuer"
-        required: true
+        description: "Nombre de posts à traiter"
+        required: false
         default: "1"
       DRY_RUN:
-        description: "TRUE = simulation / FALSE = publication réelle"
-        required: true
-        default: "FALSE"
-  # Planification optionnelle (toutes les 6h)
-  schedule:
-    - cron: "0 */6 * * *"
-
-permissions:
-  contents: read
+        description: "Ne pas publier (True/False)"
+        required: false
+        default: "False"
 
 jobs:
-  run:
-    name: courir
+  courir:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
-    # Variables d'environnement (inputs + secrets)
     env:
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      PLAYWRIGHT_BROWSERS_PATH: "0"
-      PYTHONUNBUFFERED: "1"
-
-      ACCOUNT: ${{ github.event.inputs.ACCOUNT }}
-      POSTS_TO_PUBLISH: ${{ github.event.inputs.POSTS_TO_PUBLISH }}
-      DRY_RUN: ${{ github.event.inputs.DRY_RUN }}
-
-      # ⬇️ Secrets à définir dans Settings → Secrets and variables → Actions
+      ACCOUNT: ${{ inputs.ACCOUNT }}
+      POSTS_TO_PUBLISH: ${{ inputs.POSTS_TO_PUBLISH }}
+      DRY_RUN: ${{ inputs.DRY_RUN }}
+      # Secrets à renseigner dans Settings > Secrets and variables > Actions
       TIKTOK_COOKIE: ${{ secrets.TIKTOK_COOKIE }}
       TIKTOK_UA: ${{ secrets.TIKTOK_UA }}
 
@@ -55,24 +40,20 @@ jobs:
       - name: Upgrade pip + install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install playwright
-          fi
-
-      - name: Install Playwright + Chromium (même interpréteur)
-        run: |
+          pip install -r requirements.txt
+          # Playwright + browsers
           python -m playwright install --with-deps chromium
 
-      - name: Debug rapide
+      - name: Run python main.py
+        shell: bash
         run: |
-          echo "ACCOUNT=$ACCOUNT"
-          echo "POSTS_TO_PUBLISH=$POSTS_TO_PUBLISH"
-          echo "DRY_RUN=$DRY_RUN"
-          ls -la
-          ls -la assets || true
-
-      - name: Exécuter l'agent
-        run: |
+          set -e
           python main.py
+
+      # 👇 Toujours publier trace.zip (même si le run échoue)
+      - name: Upload Playwright trace (always)
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: trace
+          path: trace.zip
