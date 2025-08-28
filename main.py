@@ -15,11 +15,11 @@ ACCOUNT = os.getenv("ACCOUNT", "default")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 POSTS_TO_PUBLISH = int(os.getenv("POSTS_TO_PUBLISH", "1"))
 
-VIDEO_PATH = Path("assets/test.mp4")            # ← ta vidéo dans le repo
+VIDEO_PATH = Path("assets/test.mp4")
 CAPTION_TEXT = os.getenv("CAPTION_TEXT", "")
 
-COOKIE_RAW = os.getenv("TIKTOK_COOKIE", "")     # JSON array de cookies
-UA_RAW = os.getenv("TIKTOK_UA", "")             # user-agent optionnel
+COOKIE_RAW = os.getenv("TIKTOK_COOKIE", "")
+UA_RAW = os.getenv("TIKTOK_UA", "")
 
 def log(msg: str) -> None: print(msg, flush=True)
 def warn(msg: str) -> None: print(f"[WARN] {msg}", flush=True)
@@ -46,35 +46,25 @@ WantedCookieNames = {
 def _normalize_same_site(v: Any) -> str:
     s = (str(v) if v is not None else "").strip().lower()
     if s in ("lax", "strict", "none"):
-        return s.capitalize()  # Lax/Strict/None
+        return s.capitalize()
     return "Lax"
 
 def _coerce_expires(v: Any) -> Optional[int]:
-    """
-    - Si v est un int/float -> int(v)
-    - Si v est un str numérique -> int(v)
-    - Sinon -> None (et on supprimera la clé)
-    """
     if isinstance(v, (int, float)):
         return int(v)
-    if isinstance(v, str):
-        vs = v.strip()
-        if vs.isdigit():
-            return int(vs)
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
     return None
 
 def parse_cookie_secret(raw: str) -> List[Dict[str, Any]]:
     if not raw.strip():
         return []
-
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
         fail(f"Impossible de parser TIKTOK_COOKIE: {e}")
-
     if not isinstance(parsed, list):
-        fail("TIKTOK_COOKIE doit être un JSON array de cookies.")
-
+        fail("TIKTOK_COOKIE doit être un JSON array.")
     mapped: List[Dict[str, Any]] = []
     for c in parsed:
         try:
@@ -86,28 +76,19 @@ def parse_cookie_secret(raw: str) -> List[Dict[str, Any]]:
                 continue
             if name not in WantedCookieNames:
                 continue
-
             cookie: Dict[str, Any] = {
-                "name": name,
-                "value": value,
-                "domain": domain,
-                "path": path,
+                "name": name, "value": value, "domain": domain, "path": path,
                 "httpOnly": bool(c.get("httpOnly", c.get("HttpOnly", False))),
                 "secure":   bool(c.get("secure",   c.get("Secure",   True))),
                 "sameSite": _normalize_same_site(c.get("sameSite") or c.get("SameSite")),
             }
-
-            # expires: on ne l'ajoute QUE s'il est strictement numérique
             exp_raw = c.get("expires") or c.get("Expires")
             exp_num = _coerce_expires(exp_raw)
             if exp_num is not None:
                 cookie["expires"] = exp_num
-            # sinon on n'ajoute pas la clé 'expires' (évite l'erreur Playwright)
-
             mapped.append(cookie)
         except Exception:
             continue
-
     return mapped
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -115,52 +96,121 @@ def parse_cookie_secret(raw: str) -> List[Dict[str, Any]]:
 # ──────────────────────────────────────────────────────────────────────────────
 STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload"
 
-def find_file_chooser_button(page) -> Optional[Any]:
-    candidates = [
-        "input[type='file'][accept*='video']",
+def wait_upload_shell(page, timeout_ms: int = 60_000) -> None:
+    # Attendre un minimum d’UI de la page d’upload
+    hints = [
         "input[type='file']",
+        "[data-e2e='upload']",
+        "button:has-text('Importer')",
+        "button:has-text('Upload')",
+    ]
+    for sel in hints:
+        try:
+            page.locator(sel).first.wait_for(state="attached", timeout=timeout_ms)
+            return
+        except PWTimeout:
+            continue
+    # fallback léger
+    page.wait_for_timeout(1500)
+
+def _make_visible(el_handle) -> None:
+    try:
+        el_handle.evaluate("""(el) => {
+            try {
+              el.hidden = false;
+              el.removeAttribute('hidden');
+              el.style.display = 'block';
+              el.style.opacity = '1';
+              el.style.visibility = 'visible';
+              el.style.pointerEvents = 'auto';
+              const p = el.parentElement;
+              if (p) {
+                p.hidden = false;
+                p.removeAttribute('hidden');
+                p.style.display = 'block';
+                p.style.opacity = '1';
+                p.style.visibility = 'visible';
+              }
+            } catch (e) {}
+        }""")
+    except Exception:
+        pass
+
+def attach_file_direct_anywhere(page, video_path: Path) -> bool:
+    """
+    Essaie de poser le fichier sur TOUT input[type=file] trouvé :
+    - sur la page
+    - dans tous les iframes
+    Même si caché : on force la visibilité via JS.
+    """
+    frames = [page] + page.frames
+    for fr in frames:
+        try:
+            loc = fr.locator("input[type='file']")
+            n = loc.count()
+            for i in range(n):
+                h = loc.nth(i).element_handle()
+                if not h:
+                    continue
+                _make_visible(h)
+                try:
+                    loc.nth(i).set_input_files(str(video_path))
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+def try_open_file_chooser(page) -> Optional[Any]:
+    """
+    Clique des boutons connus pour ouvrir le file chooser.
+    """
+    candidates = [
         "[data-e2e='upload-button']",
         "[data-e2e='file-select']",
         "[data-testid='upload-btn']",
         "button:has-text('Importer')",
         "button:has-text('Upload')",
         "button:has-text('Select file')",
+        "button:has-text('Select files')",
+        "button:has-text('Choose file')",
     ]
     for sel in candidates:
         try:
-            el = page.locator(sel)
-            if el.count() > 0 and el.first.is_visible():
-                return el.first
+            btn = page.locator(sel).first
+            if btn.count() and btn.is_visible():
+                with page.expect_file_chooser() as fc_info:
+                    btn.click()
+                return fc_info.value
         except Exception:
-            pass
-    return None
-
-def attach_file_direct_if_possible(page, video_path: Path) -> bool:
+            continue
+    # tenter sur tous les boutons visibles si pas trouvé
     try:
-        inp = page.locator("input[type='file']")
-        if inp.count() == 0:
-            return False
-        for i in range(inp.count()):
-            el = inp.nth(i)
+        buttons = page.locator("button")
+        for i in range(min(buttons.count(), 200)):
+            b = buttons.nth(i)
             try:
-                if el.is_visible():
-                    el.set_input_files(str(video_path))
-                    return True
+                if b.is_visible():
+                    with page.expect_file_chooser() as fc_info:
+                        b.click()
+                    return fc_info.value
             except Exception:
                 continue
-        return False
     except Exception:
-        return False
+        pass
+    return None
 
-def wait_upload_ready(page, timeout_ms: int = 120_000) -> None:
-    candidates = [
+def wait_upload_ready(page, timeout_ms: int = 180_000) -> None:
+    probes = [
         "button:has-text('Publier')",
         "button:has-text('Post')",
         "[data-e2e='publish-button']",
+        "textarea",
         "text=Confidentialité",
         "text=Description",
     ]
-    for sel in candidates:
+    for sel in probes:
         try:
             page.locator(sel).first.wait_for(state="visible", timeout=timeout_ms)
             return
@@ -210,8 +260,7 @@ def publish_now(page) -> bool:
     ]
     for sel in labels:
         try:
-            ok = scroll_into_view_and_click(page, sel, retries=60)
-            if ok:
+            if scroll_into_view_and_click(page, sel, retries=80):
                 return True
         except Exception:
             pass
@@ -246,10 +295,10 @@ def publish_once(cookie_raw: str, caption: str, video_path: Path, ua_raw: str) -
     info(f"Compte ciblé: {ACCOUNT} | Posts: 1 | DRY_RUN={DRY_RUN}")
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        context_args = {}
+        ctx_args = {}
         if ua_raw.strip():
-            context_args["user_agent"] = ua_raw.strip()
-        context = browser.new_context(**context_args)
+            ctx_args["user_agent"] = ua_raw.strip()
+        context = browser.new_context(**ctx_args)
 
         info(f"Injection cookies ({len(cookies)} entrées)…")
         try:
@@ -259,41 +308,41 @@ def publish_once(cookie_raw: str, caption: str, video_path: Path, ua_raw: str) -
 
         page = context.new_page()
         info("[NAV] Vers TikTok Studio Upload")
-        page.goto("https://www.tiktok.com/tiktokstudio/upload", wait_until="domcontentloaded")
+        page.goto(STUDIO_URL, wait_until="domcontentloaded")
+        wait_upload_shell(page)
 
-        attached = attach_file_direct_if_possible(page, video_path)
-        if not attached:
-            btn = find_file_chooser_button(page)
-            if not btn:
+        # 1) Tenter l’injection directe partout (page + iframes), même si input caché
+        if attach_file_direct_anywhere(page, video_path):
+            info("Upload (input direct) déclenché ✅")
+        else:
+            # 2) Tenter l’ouverture d’un file chooser
+            fc = try_open_file_chooser(page)
+            if not fc:
                 fail("Bouton pour ouvrir le file chooser introuvable.")
-            with page.expect_file_chooser() as fc_info:
-                btn.click()
             try:
-                fc = fc_info.value
                 fc.set_files(str(video_path))
-                attached = True
+                info("Upload (file chooser) déclenché ✅")
             except Exception as e:
                 fail(f"Impossible de fournir le fichier via 'file chooser': {e}")
 
-        info("Upload déclenché ✅")
+        # Attendre que l’écran de post soit prêt
         wait_upload_ready(page, timeout_ms=180_000)
 
-        if caption.strip():
-            try:
-                fill_caption_if_present(page, caption.strip())
+        # Légende
+        try:
+            fill_caption_if_present(page, caption)
+            if caption.strip():
                 info("Légende insérée.")
-            except Exception:
-                warn("Impossible de remplir la légende (textarea non trouvé).")
+        except Exception:
+            warn("Impossible de remplir la légende (textarea non trouvé).")
 
         if DRY_RUN:
             info("Publication tentée (DRY_RUN=True).")
-            context.close()
-            browser.close()
+            context.close(); browser.close()
             return True
 
         ok = publish_now(page)
-        context.close()
-        browser.close()
+        context.close(); browser.close()
         return ok
 
 def main() -> None:
@@ -305,12 +354,8 @@ def main() -> None:
     success = 0
     for i in range(POSTS_TO_PUBLISH):
         info(f"— Post {i+1} / {POSTS_TO_PUBLISH} —")
-        try:
-            ok = publish_once(COOKIE_RAW, CAPTION_TEXT, VIDEO_PATH, UA_RAW)
-            if ok:
-                success += 1
-        except Exception as e:
-            fail(str(e))
+        ok = publish_once(COOKIE_RAW, CAPTION_TEXT, VIDEO_PATH, UA_RAW)
+        if ok: success += 1
     info(f"Run terminé ✅ ({success}/{POSTS_TO_PUBLISH} réussis)")
     if success == 0:
         sys.exit(1)
