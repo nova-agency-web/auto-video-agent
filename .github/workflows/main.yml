@@ -1,30 +1,22 @@
-name: Agent vidéo automatique
+name: courir
 
 on:
   workflow_dispatch:
-    inputs:
-      ACCOUNT:
-        description: "Compte ciblé (libre)"
-        required: false
-        default: "trucs-malins"
-      POSTS_TO_PUBLISH:
-        description: "Nombre de posts à traiter"
-        required: false
-        default: "1"
-      DRY_RUN:
-        description: "Ne pas publier (True/False)"
-        required: false
-        default: "False"
+  schedule:
+    - cron: "0 6 * * *" # facultatif : tous les jours à 06:00 UTC
+
+permissions:
+  contents: read
 
 jobs:
   courir:
     runs-on: ubuntu-latest
 
     env:
-      ACCOUNT: ${{ inputs.ACCOUNT }}
-      POSTS_TO_PUBLISH: ${{ inputs.POSTS_TO_PUBLISH }}
-      DRY_RUN: ${{ inputs.DRY_RUN }}
-      # Secrets à renseigner dans Settings > Secrets and variables > Actions
+      ACCOUNT: ${{ vars.ACCOUNT || 'trucs-malins' }}
+      POSTS_TO_PUBLISH: ${{ vars.POSTS_TO_PUBLISH || '1' }}
+      DRY_RUN: ${{ vars.DRY_RUN || 'False' }}
+      # Secrets à définir dans Settings > Secrets and variables > Actions
       TIKTOK_COOKIE: ${{ secrets.TIKTOK_COOKIE }}
       TIKTOK_UA: ${{ secrets.TIKTOK_UA }}
 
@@ -41,19 +33,65 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Playwright + browsers
+
+      - name: Install Playwright + Chromium (same interpreter)
+        run: |
           python -m playwright install --with-deps chromium
 
-      - name: Run python main.py
+      # (Optionnel) Nettoyage d’anciens artefacts locaux
+      - name: Prepare trace folder
+        run: |
+          rm -rf trace playwright-report || true
+          mkdir -p trace
+
+      - name: Run agent
+        id: run_agent
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          echo "### Lancement de main.py" >> $GITHUB_STEP_SUMMARY
           python main.py
+        # Si ton script génère une trace Playwright, garde le "if: always()" ci-dessous pour upload
 
-      # 👇 Toujours publier trace.zip (même si le run échoue)
+      # ─────────────────────────────────────────────
+      #  UPLOAD DES ARTEFACTS (version v4 obligatoire)
+      # ─────────────────────────────────────────────
+
+      - name: Zip trace folder (if exists)
+        if: always()
+        run: |
+          if [ -d "trace" ]; then
+            (cd trace && zip -9 -r ../trace.zip .) || true
+          fi
+          if [ -d "playwright-report" ]; then
+            (cd playwright-report && zip -9 -r ../playwright-report.zip .) || true
+          fi
+
       - name: Upload Playwright trace (always)
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: trace
           path: trace.zip
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload Playwright HTML report (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report.zip
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs
+          path: |
+            **/*.log
+            logs/**
+          if-no-files-found: ignore
+          retention-days: 7
